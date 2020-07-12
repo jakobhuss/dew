@@ -25,9 +25,9 @@ Usage of ./dew:
 
 ## Features
 
-[x] resolve
-[x] retry
-[x] dewildcard
-[ ] verify
-[ } exclude bad resolvers
-[x] print
+ - [x] resolve
+ - [x] retry
+ - [x] dewildcard
+ - [ ] verify
+ - [ ] exclude bad resolvers
+ - [x] print
