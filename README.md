@@ -2,7 +2,7 @@
 
 ## Compile
 ```
-go build dew.go
+make
 ```
 
 ## Usage
