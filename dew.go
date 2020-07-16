@@ -45,7 +45,9 @@ func main() {
 	wg.Wait()
 	log.Println("Number of input domains:", count)
 
-	printWildcards()
+	if pw {
+		printWildcards()
+	}
 }
 
 func worker(resolvers []net.IP, ch chan string, wg *sync.WaitGroup) {
@@ -54,9 +56,10 @@ func worker(resolvers []net.IP, ch chan string, wg *sync.WaitGroup) {
 	i := 0
 	for d := range ch {
 		var msg *dns.Msg
+		resolver := resolvers[i%len(resolvers)]
 		for j := 0; j < 5; j++ {
 			var err error
-			msg, err = query_resolver(d, resolvers[i%len(resolvers)])
+			msg, err = query_resolver(d, resolver)
 			i++
 			if err != nil {
 				// TODO error handling
@@ -70,8 +73,8 @@ func worker(resolvers []net.IP, ch chan string, wg *sync.WaitGroup) {
 			continue
 		}
 
+		log.Println("Response:", d, dns.RcodeToString[msg.MsgHdr.Rcode], msg.Answer, "resolver:", resolver)
 		if msg.MsgHdr.Rcode > 0 {
-			log.Println("Rcode for msg:", msg.MsgHdr.Rcode, dns.RcodeToString[msg.MsgHdr.Rcode])
 			continue
 		}
 
@@ -79,7 +82,18 @@ func worker(resolvers []net.IP, ch chan string, wg *sync.WaitGroup) {
 			continue
 		}
 
+		// TODO do cache wildcard check first
+		// then do verify
+		// then do new wildcard check
 		if is_wildcard(d, msg) {
+			continue
+		}
+
+		if !verify(d, msg) {
+			continue
+		}
+
+		if pw {
 			continue
 		}
 
@@ -90,14 +104,42 @@ func worker(resolvers []net.IP, ch chan string, wg *sync.WaitGroup) {
 func query_resolver(q string, resolver net.IP) (*dns.Msg, error) {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(q), dns.TypeA)
+	m.RecursionDesired = true
 	return dns.Exchange(m, resolver.String()+":53")
+}
+
+func verify(d string, msg *dns.Msg) bool {
+	votes := 0
+	for i := 0; i < 5; i++ {
+		resolver := resolvers[rand.Intn(len(resolvers))]
+		check_msg, err := query_resolver(d, resolver)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+
+		//TODO better check for finding bad resolved domains
+		if len(check_msg.Answer) == 0 {
+			votes--
+			log.Println("Minus vote:", d, dns.RcodeToString[check_msg.MsgHdr.Rcode], check_msg.Answer, "resolver:", resolver)
+		} else {
+			votes++
+		}
+	}
+
+	if votes < 0 {
+		log.Println("Verification failed of domain:", d, msg.Answer)
+		return false
+	}
+
+	return true
 }
 
 func is_wildcard(d string, msg *dns.Msg) bool {
 	levels := GenLevels(d)
 	msg_addrs := GetIpv4Addrs(*msg)
 
-	for i := 1; i < len(levels)-1; i++ {
+	for i := 0; i < len(levels)-1; i++ {
 		if val, ok := wildcards[levels[i]]; ok {
 			if KeyIntersect(msg_addrs, val) {
 				log.Println(msg_addrs, val)
@@ -112,7 +154,7 @@ func is_wildcard(d string, msg *dns.Msg) bool {
 
 	var wildcard string
 	var addrs map[string]bool
-	for i := 1; i < len(levels)-1; i++ {
+	for i := 0; i < len(levels)-1; i++ {
 		resolver := resolvers[rand.Intn(len(resolvers))]
 		check_msg, err := query_resolver(RandString(20)+"."+levels[i], resolver)
 		if err != nil {
@@ -141,9 +183,9 @@ func is_wildcard(d string, msg *dns.Msg) bool {
 				}
 			}
 		} else {
-		  mutex.Lock()
+			mutex.Lock()
 			wildcards[wildcard] = addrs
-		  mutex.Unlock()
+			mutex.Unlock()
 			log.Println("*."+wildcard, addrs)
 		}
 	}
@@ -153,7 +195,7 @@ func is_wildcard(d string, msg *dns.Msg) bool {
 		return true
 	}
 
-	log.Println("Found unique ips:", msg_addrs, addrs)
+	log.Println("Found unique ips:", d, msg_addrs, addrs)
 	return false
 }
 
@@ -197,23 +239,25 @@ func RandString(n int) string {
 }
 
 func printWildcards() {
-	for k, _ := range wildcards {
-		fmt.Println("*." + k)
+	for wildcard, ips := range wildcards {
+		s := "*." + wildcard
+		if verbose {
+			for ip, _ := range ips {
+				s += " " + ip
+			}
+		}
+		fmt.Println(s)
 	}
 }
 
 func out(d string, msg *dns.Msg) {
-	if pw {
-		return
-	}
-
-	fmt.Print(d)
+	s := d
 	if verbose {
-		for k, _ := range GetIpv4Addrs(*msg) {
-			fmt.Print(" ", k)
+		for ip, _ := range GetIpv4Addrs(*msg) {
+			s += " " + ip
 		}
 	}
-	fmt.Println()
+	fmt.Println(s)
 }
 
 func parseFlags() {
@@ -222,14 +266,14 @@ func parseFlags() {
 	flag.BoolVar(&verbose, "v", false, "Enables ip numbers printing to output")
 	flag.BoolVar(&pw, "pw", false, "Prints all found wildcard domains")
 
-  help := flag.Bool("help", false, "Prints help text")
-  flag.BoolVar(help, "h", *help, "alias for -help")
+	help := flag.Bool("help", false, "Prints help text")
+	flag.BoolVar(help, "h", *help, "alias for -help")
 	flag.Parse()
 
-  if *help {
-    flag.Usage()
-    os.Exit(0)
-  }
+	if *help {
+		flag.Usage()
+		os.Exit(0)
+	}
 
 	resolvers = get_resolvers()
 }

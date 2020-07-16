@@ -27,6 +27,12 @@ Usage of ./dew:
  - [x] resolve
  - [x] retry
  - [x] dewildcard
- - [ ] verify
+ - [x] verify (naive impelentation implemented)
  - [ ] exclude bad resolvers
  - [x] print
+
+## TODO
+
+Some servers returns NOERROR for missing A records
+Some servers returns NXDOMAIN for missing A records
+We should both look at Rcode and Answer section before disregardning a domain
