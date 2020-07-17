@@ -18,12 +18,3 @@ func TestGenLevels(t *testing.T) {
 		t.Errorf("Expected: %s actual: %s", expected, ans)
 	}
 }
-
-func TestRandString(t *testing.T) {
-	n := 7
-	s := RandString(n)
-
-	if len(s) != n {
-		t.Errorf("Expected: %d actual %d", n, len(s))
-	}
-}

@@ -7,196 +7,375 @@ import "os"
 import "log"
 import "net"
 import "sync"
+import "time"
+import "regexp"
 import "strings"
 import "math/rand"
 import "github.com/miekg/dns"
+import "crypto/md5"
+import "encoding/hex"
 
 //flags
-var resolver_file string
-var num_goroutines int
+var resolverFile string
+var nGoroutines int
 var verbose bool
-var pw bool
+var debug bool
+var dnsTimeout time.Duration
+var nConcurrentJobs int
+var minVerifications int
 
-//constants
+//globals
 var famousResolvers = []string{"1.0.0.1", "1.1.1.1", "149.112.112.112", "176.103.130.130", "176.103.130.131", "185.228.168.9", "185.228.169.9", "198.101.242.72", "207.67.222.222", "208.67.220.220", "208.67.222.222", "23.253.163.53", "64.6.64.6", "64.6.65.6", "8.8.4.4", "8.8.8.8", "9.9.9.9"}
 
-var mutex = &sync.Mutex{}
+var inputDone = false
+
+var jobs = map[string]bool{}
+var jobsMutex = &sync.RWMutex{}
+
 var wildcards = map[string]map[string]bool{}
 var resolvers []net.IP
+var dnsch chan string
+var wg = sync.WaitGroup{}
+
+var lookups = map[string]*DnsJob{}
+var lookupsMutex = &sync.RWMutex{}
+
+type DnsJob struct {
+	sync.Mutex
+	Name        string
+	NLookups    int
+	RequestTime time.Time
+	Lookups     map[string]*dns.Msg
+}
 
 func main() {
 	parseFlags()
+	resolvers = getResolvers()
+	dnsch = make(chan string, nGoroutines*nConcurrentJobs)
+	startGoroutines(&wg)
+	wg.Wait()
+}
 
-	var wg sync.WaitGroup
-	ch := make(chan string)
+func startGoroutines(wg *sync.WaitGroup) {
+	for i := 0; i < nGoroutines; i++ {
+		c, err := net.ListenUDP("udp", nil)
 
-	for i := 0; i < num_goroutines; i++ {
-		wg.Add(1)
-		go worker(resolvers, ch, &wg)
+		if err != nil {
+			log.Panic(err)
+		}
+
+		wg.Add(2)
+		go sender(dnsch, c, wg)
+		go reciever(c, wg)
 	}
+
+	wg.Add(3)
+	go retryer(wg)
+	go worker(&jobs, wg)
+	go loadJobs(&jobs, wg)
+}
+
+func loadJobs(jobs *map[string]bool, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	count := 0
 	for scanner := bufio.NewScanner(os.Stdin); scanner.Scan(); count++ {
-		ch <- scanner.Text()
+		for len(*jobs) > nConcurrentJobs {
+			shortSleep()
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if matched, _ := regexp.MatchString(`^[a-z0-9.-]{4,}$`, line); !matched {
+			continue
+		}
+		debugLog("Adds new domain job:", line)
+		jobsMutex.Lock()
+		(*jobs)[line] = true
+		jobsMutex.Unlock()
 	}
-
-	close(ch)
-
-	wg.Wait()
-	log.Println("Number of input domains:", count)
-
-	if pw {
-		printWildcards()
-	}
+	debugLog("Number of input domains:", count)
+	inputDone = true
 }
 
-func worker(resolvers []net.IP, ch chan string, wg *sync.WaitGroup) {
+func retryer(wg *sync.WaitGroup) {
 	defer wg.Done()
-
-	i := 0
-	for d := range ch {
-		var msg *dns.Msg
-		resolver := resolvers[i%len(resolvers)]
-		for j := 0; j < 5; j++ {
-			var err error
-			msg, err = query_resolver(d, resolver)
-			i++
-			if err != nil {
-				// TODO error handling
-				log.Println(err)
+	for hasWork() {
+		debugLog("Starting retryer loop")
+		shortSleep()
+		lookupsMutex.RLock()
+		for d, dnsJob := range lookups {
+			if len(dnsJob.Lookups) == dnsJob.NLookups || dnsJob.RequestTime.Add(dnsTimeout).After(time.Now()) {
 				continue
 			}
-			break
+			debugLog("Sending new requests:", d)
+			for i := len(dnsJob.Lookups); i < dnsJob.NLookups; i++ {
+				dnsch <- d
+			}
 		}
-
-		if msg == nil {
-			continue
-		}
-
-		log.Println("Response:", d, dns.RcodeToString[msg.MsgHdr.Rcode], msg.Answer, "resolver:", resolver)
-		if msg.MsgHdr.Rcode > 0 {
-			continue
-		}
-
-		if len(msg.Answer) == 0 {
-			continue
-		}
-
-		// TODO do cache wildcard check first
-		// then do verify
-		// then do new wildcard check
-		if is_wildcard(d, msg) {
-			continue
-		}
-
-		if !verify(d, msg) {
-			continue
-		}
-
-		if pw {
-			continue
-		}
-
-		out(d, msg)
+		lookupsMutex.RUnlock()
 	}
 }
 
-func query_resolver(q string, resolver net.IP) (*dns.Msg, error) {
+func sender(ch chan string, c *net.UDPConn, wg *sync.WaitGroup) {
+	defer wg.Done()
+	defer c.Close()
+	for d := range ch {
+		j, ok := getLookup(d)
+		if !ok {
+			debugLog("No lookup for domain:", d)
+			continue
+		}
+
+		logErr(sendDns(d, j, c))
+	}
+	debugLog("Dns channel is closed")
+}
+
+func sendDns(d string, j *DnsJob, c *net.UDPConn) error {
+	debugLog("Sending dns:", d)
+	resolver := resolvers[rand.Intn(len(resolvers))]
+	addr := &net.UDPAddr{IP: resolver, Port: 53}
+
 	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(q), dns.TypeA)
+	m.SetQuestion(d, dns.TypeA)
 	m.RecursionDesired = true
-	return dns.Exchange(m, resolver.String()+":53")
+
+	msg, err2 := m.Pack()
+	logErr(err2)
+	_, err3 := c.WriteTo(msg, addr)
+	logErr(err3)
+	j.Lock()
+	j.RequestTime = time.Now()
+	j.Unlock()
+	return err3
 }
 
-func verify(d string, msg *dns.Msg) bool {
-	votes := 0
-	for i := 0; i < 5; i++ {
-		resolver := resolvers[rand.Intn(len(resolvers))]
-		check_msg, err := query_resolver(d, resolver)
-		if err != nil {
-			log.Println(err)
+func reciever(c *net.UDPConn, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for hasWork() {
+		buff := make([]byte, 4096)
+		c.SetReadDeadline(time.Now().Add(dnsTimeout))
+		_, addr, err := c.ReadFrom(buff)
+
+		logErr(err)
+		if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+			debugLog("Timeout reached. Number of jobs:", len(jobs))
+			continue
+		} else if ok {
+			return
+		}
+
+		m := new(dns.Msg)
+		m.Unpack(buff)
+
+		if len(m.Question) != 1 {
 			continue
 		}
 
-		//TODO better check for finding bad resolved domains
-		if len(check_msg.Answer) == 0 {
-			votes--
-			log.Println("Minus vote:", d, dns.RcodeToString[check_msg.MsgHdr.Rcode], check_msg.Answer, "resolver:", resolver)
-		} else {
-			votes++
+		name := m.Question[0].Name
+		j, ok := getLookup(name)
+		if !ok {
+			debugLog("Recieved response with unwanted question:", name)
+			continue
 		}
+		debugLog("Recieved response for:", name)
+		j.Lock()
+		j.Lookups[addr.String()] = m
+		j.Unlock()
+	}
+}
+
+func logErr(err error) bool {
+	if err != nil {
+		debugLog(err)
+		return true
+	}
+	return false
+}
+
+func debugLog(v ...interface{}) {
+	if debug {
+		log.Println(v...)
+	}
+}
+
+func worker(jobs *map[string]bool, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for hasWork() {
+		debugLog("Worker loop")
+		jobsMutex.RLock()
+		for d, _ := range *jobs {
+			debugLog("Checking job status:", d)
+			checkJobProgress(d, jobs, dnsch)
+		}
+		jobsMutex.RUnlock()
+		shortSleep()
+	}
+	debugLog("No jobs left")
+	close(dnsch)
+}
+
+func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
+	fullDomain := dns.Fqdn(d)
+	dnsJob, ok := getLookup(fullDomain)
+	if !ok {
+		createLookup(fullDomain)
+		return
 	}
 
-	if votes < 0 {
-		log.Println("Verification failed of domain:", d, msg.Answer)
+	if len(dnsJob.Lookups) == 0 {
+		return
+	}
+
+	msg := dnsJob.getAMsg()
+
+	switch msg.MsgHdr.Rcode {
+	case dns.RcodeSuccess:
+		if dnsJob.NLookups < minVerifications {
+			dnsJob.setNLookups(minVerifications)
+			debugLog("Need more results for verification", len(dnsJob.Lookups))
+		} else if verify(dnsJob.Lookups) {
+			if isCachedWildcard(msg, &wildcards) {
+				debugLog("Cache hit for wildcard domain")
+			} else {
+				//wildcard check for domain d
+				wd := BuildWildcardCheckDomain(fullDomain)
+				wildcardDnsJob, ok := getLookup(wd)
+				if !ok {
+					debugLog("No wildcard check domain found, sending out dns for:", wd)
+					createLookup(wd)
+					return
+				} else if len(wildcardDnsJob.Lookups) == 0 {
+					return
+				} else if isWildcard(&dnsJob.Lookups, &wildcardDnsJob.Lookups) {
+					debugLog("Domain is a wildcard:", d)
+					//TODO add to wildcard cache
+					//TODO remove wd from lookups
+					removeJob(d, jobs, "wildcard")
+				} else {
+					//Not a wildcard, lets print
+					out(d, msg)
+					removeJob(d, jobs, "success")
+				}
+			}
+		} else {
+			removeJob(d, jobs, "verfication_failed")
+		}
+		return
+	case dns.RcodeNameError:
+		removeJob(d, jobs, "NXDOMAIN")
+	default:
+		//TODO check if we want to abort all other Rcodes
+		//There should be a retry mechanism
+		removeJob(d, jobs, "unknown_Rcode")
+		debugLog("Unhandled Rcode", msg.MsgHdr.Rcode, d, len(*jobs))
+	}
+}
+
+func getLookup(d string) (*DnsJob, bool) {
+	lookupsMutex.RLock()
+	dnsJob, ok := lookups[d]
+	lookupsMutex.RUnlock()
+	return dnsJob, ok
+}
+
+func createLookup(d string) {
+	debugLog("Creating new dns job:", d)
+	lookupsMutex.Lock()
+	lookups[d] = &DnsJob{Name: d, Lookups: map[string]*dns.Msg{}, NLookups: 1}
+	lookupsMutex.Unlock()
+}
+
+func hasWork() bool {
+	return !inputDone || len(jobs) > 0
+}
+
+func removeJob(d string, jobs *map[string]bool, reason string) {
+	debugLog("Job done:", d, reason)
+	delete(*jobs, d)
+	clearLookups(dns.Fqdn(d))
+}
+
+func clearLookups(d string) {
+	lookupsMutex.Lock()
+	delete(lookups, d)
+	lookupsMutex.Unlock()
+}
+
+func verify(msgs map[string]*dns.Msg) bool {
+	//TODO improve verification algorithm
+	//TODO penalize bad resolvers
+	votes := 0
+	var m *dns.Msg
+	for _, msg := range msgs {
+		m = msg
+		if len(msg.Answer) > 0 {
+			votes++
+		} else {
+			votes--
+		}
+	}
+	d := m.Question[0].Name
+	if votes < 1 {
+		debugLog("Verification failed for domain:", d)
 		return false
 	}
+	debugLog("Verification succeded for domain:", d)
 
 	return true
 }
 
-func is_wildcard(d string, msg *dns.Msg) bool {
-	levels := GenLevels(d)
+func (dnsJob *DnsJob) setNLookups(n int) {
+	dnsJob.Lock()
+	dnsJob.RequestTime = time.Time{}
+	dnsJob.NLookups = n
+	dnsJob.Unlock()
+}
+
+func (dnsJob *DnsJob) getAMsg() *dns.Msg {
+	for _, msg := range dnsJob.Lookups {
+		return msg
+	}
+	return nil
+}
+
+func isCachedWildcard(msg *dns.Msg, cache *map[string]map[string]bool) bool {
+	levels := GenLevels(msg.Question[0].Name)
 	msg_addrs := GetIpv4Addrs(*msg)
 
 	for i := 0; i < len(levels)-1; i++ {
-		if val, ok := wildcards[levels[i]]; ok {
+		if val, ok := (*cache)[levels[i]]; ok {
 			if KeyIntersect(msg_addrs, val) {
-				log.Println(msg_addrs, val)
+				debugLog(msg_addrs, val)
 				return true
 			}
-			return true
 		}
 	}
-
-	// no cached entry found
-	// do wildcard lookup
-
-	var wildcard string
-	var addrs map[string]bool
-	for i := 0; i < len(levels)-1; i++ {
-		resolver := resolvers[rand.Intn(len(resolvers))]
-		check_msg, err := query_resolver(RandString(20)+"."+levels[i], resolver)
-		if err != nil {
-			//TODO this error should be handled better
-			//returning true here is wrong
-			log.Println(err)
-			return true
-		}
-
-		if len(check_msg.Answer) == 0 {
-			//this lvl is not a wildcard
-			break
-		}
-
-		wildcard = levels[i]
-		addrs = GetIpv4Addrs(*check_msg)
-	}
-
-	if wildcard != "" {
-		log.Println("Wildcard found *." + wildcard)
-		if val, ok := wildcards[wildcard]; ok {
-			for ip, _ := range addrs {
-				if _, ok := val[ip]; !ok {
-					val[ip] = true
-					log.Println("Appending new wildcard ip:", ip)
-				}
-			}
-		} else {
-			mutex.Lock()
-			wildcards[wildcard] = addrs
-			mutex.Unlock()
-			log.Println("*."+wildcard, addrs)
-		}
-	}
-
-	if KeyIntersect(addrs, msg_addrs) {
-		log.Println("This is wildcard with addrs:", addrs)
-		return true
-	}
-
-	log.Println("Found unique ips:", d, msg_addrs, addrs)
 	return false
+}
+
+func isWildcard(msgs, wmsgs *map[string]*dns.Msg) bool {
+	var msg *dns.Msg
+	var wmsg *dns.Msg
+
+	if len((*wmsgs)) == 0 {
+		return false
+	}
+
+	for _, v := range *msgs {
+		msg = v
+	}
+	for _, v := range *wmsgs {
+		wmsg = v
+	}
+
+	if len((*wmsg).Answer) == 0 {
+		return false
+	}
+	maddr := GetIpv4Addrs(*msg)
+	waddr := GetIpv4Addrs(*wmsg)
+
+	return KeyIntersect(maddr, waddr)
 }
 
 func KeyIntersect(a map[string]bool, b map[string]bool) bool {
@@ -228,14 +407,9 @@ func GetIpv4Addrs(msg dns.Msg) map[string]bool {
 	return addrs
 }
 
-func RandString(n int) string {
-	const lower = "abcdefghijklmnopqrstuvwxyz"
-	bytes := make([]byte, n)
-	for i := range bytes {
-		bytes[i] = lower[rand.Intn(len(lower))]
-	}
-
-	return string(bytes)
+func BuildWildcardCheckDomain(d string) string {
+	base := strings.SplitN(d, ".", 2)[1]
+	return strings.ToLower(GetMD5Hash(base+"Salt: 42")) + "." + base
 }
 
 func printWildcards() {
@@ -261,13 +435,16 @@ func out(d string, msg *dns.Msg) {
 }
 
 func parseFlags() {
-	flag.StringVar(&resolver_file, "r", "", "Optional but recommended resolvers file, newline separated resolver ips")
-	flag.IntVar(&num_goroutines, "c", 20, "Number of \"threads\" working, tune this for optimum performance.")
+	flag.StringVar(&resolverFile, "r", "", "Optional but recommended resolvers file, newline separated resolver ips")
+	flag.IntVar(&nGoroutines, "c", 2, "Number of \"threads\" working, tune this for optimum performance.")
 	flag.BoolVar(&verbose, "v", false, "Enables ip numbers printing to output")
-	flag.BoolVar(&pw, "pw", false, "Prints all found wildcard domains")
+	flag.BoolVar(&debug, "debug", false, "Outputs debug information")
+	flag.DurationVar(&dnsTimeout, "dt", 1000*time.Millisecond, "DNS Timeout in millisecods")
+	flag.IntVar(&nConcurrentJobs, "cj", 1000, "Number of concurrent jobs")
+	flag.IntVar(&minVerifications, "mv", 3, "Number of required verification dns requests")
 
-	help := flag.Bool("help", false, "Prints help text")
-	flag.BoolVar(help, "h", *help, "alias for -help")
+	help := flag.Bool("-help", false, "Prints help text")
+	flag.BoolVar(help, "h", *help, "alias for --help")
 	flag.Parse()
 
 	if *help {
@@ -275,14 +452,13 @@ func parseFlags() {
 		os.Exit(0)
 	}
 
-	resolvers = get_resolvers()
 }
 
-func get_resolvers() []net.IP {
+func getResolvers() []net.IP {
 	ips := famousResolvers
 
-	if resolver_file != "" {
-		ips = FileToSlice(resolver_file)
+	if resolverFile != "" {
+		ips = FileToSlice(resolverFile)
 	}
 
 	local_resolvers := []net.IP{}
@@ -319,4 +495,13 @@ func FileToSlice(f string) []string {
 	}
 
 	return lines
+}
+
+func GetMD5Hash(text string) string {
+	hash := md5.Sum([]byte(text))
+	return hex.EncodeToString(hash[:])
+}
+
+func shortSleep() {
+	time.Sleep(50 * time.Millisecond)
 }

@@ -9,13 +9,19 @@ make
 
 ```
 Usage of ./dew:
-  -c int
-    	Number of "threads" working, tune this for optimum performance. (default 20)
-  -h	alias for -help
-  -help
+  --help
     	Prints help text
-  -pw
-    	Prints all found wildcard domains
+  -c int
+    	Number of "threads" working, tune this for optimum performance. (default 2)
+  -cj int
+    	Number of concurrent jobs (default 1000)
+  -debug
+    	Outputs debug information
+  -dt duration
+    	DNS Timeout in millisecods (default 1s)
+  -h	alias for --help
+  -mv int
+    	Number of required verification dns requests (default 3)
   -r string
     	Optional but recommended resolvers file, newline separated resolver ips
   -v	Enables ip numbers printing to output
@@ -27,7 +33,7 @@ Usage of ./dew:
  - [x] resolve
  - [x] retry
  - [x] dewildcard
- - [x] verify (naive impelentation implemented)
+ - [x] verify (naive impelentation)
  - [ ] exclude bad resolvers
  - [x] print
 
