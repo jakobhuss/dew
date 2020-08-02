@@ -8,7 +8,6 @@ import "log"
 import "net"
 import "sync"
 import "time"
-import "regexp"
 import "strings"
 import "math/rand"
 import "github.com/miekg/dns"
@@ -84,9 +83,11 @@ func loadJobs(jobs *map[string]bool, wg *sync.WaitGroup) {
 			shortSleep()
 		}
 		line := strings.TrimSpace(scanner.Text())
-		if matched, _ := regexp.MatchString(`^[a-z0-9.-]{4,}$`, line); !matched {
+		if _, ok := dns.IsDomainName(line); !ok {
+			debugLog("Non valid domain name found:", line)
 			continue
 		}
+
 		debugLog("Adds new domain job:", line)
 		jobsMutex.Lock()
 		(*jobs)[line] = true
