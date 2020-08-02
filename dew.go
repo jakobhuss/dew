@@ -234,7 +234,7 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 		if dnsJob.NLookups < minVerifications {
 			dnsJob.setNLookups(minVerifications)
 			debugLog("Need more results for verification", len(dnsJob.Lookups))
-		} else if verify(dnsJob.Lookups) {
+		} else if verify(dnsJob) {
 			if isCachedWildcard(msg, &wildcards) {
 				debugLog("Cache hit for wildcard domain")
 			} else {
@@ -247,7 +247,7 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 					return
 				} else if len(wildcardDnsJob.Lookups) == 0 {
 					return
-				} else if isWildcard(&dnsJob.Lookups, &wildcardDnsJob.Lookups) {
+				} else if isWildcard(dnsJob, wildcardDnsJob) {
 					debugLog("Domain is a wildcard:", d)
 					//TODO add to wildcard cache
 					//TODO remove wd from lookups
@@ -302,9 +302,12 @@ func clearLookups(d string) {
 	lookupsMutex.Unlock()
 }
 
-func verify(msgs map[string]*dns.Msg) bool {
+func verify(j *DnsJob) bool {
 	//TODO improve verification algorithm
 	//TODO penalize bad resolvers
+	msgs := j.Lookups
+	j.Lock()
+	defer j.Unlock()
 	votes := 0
 	var m *dns.Msg
 	for _, msg := range msgs {
@@ -333,6 +336,8 @@ func (dnsJob *DnsJob) setNLookups(n int) {
 }
 
 func (dnsJob *DnsJob) getAMsg() *dns.Msg {
+	dnsJob.Lock()
+	defer dnsJob.Unlock()
 	for _, msg := range dnsJob.Lookups {
 		return msg
 	}
@@ -354,24 +359,18 @@ func isCachedWildcard(msg *dns.Msg, cache *map[string]map[string]bool) bool {
 	return false
 }
 
-func isWildcard(msgs, wmsgs *map[string]*dns.Msg) bool {
-	var msg *dns.Msg
-	var wmsg *dns.Msg
-
-	if len((*wmsgs)) == 0 {
+func isWildcard(j, wj *DnsJob) bool {
+	if len(wj.Lookups) == 0 {
 		return false
 	}
 
-	for _, v := range *msgs {
-		msg = v
-	}
-	for _, v := range *wmsgs {
-		wmsg = v
-	}
+	msg := j.getAMsg()
+	wmsg := wj.getAMsg()
 
 	if len((*wmsg).Answer) == 0 {
 		return false
 	}
+
 	maddr := GetIpv4Addrs(*msg)
 	waddr := GetIpv4Addrs(*wmsg)
 
