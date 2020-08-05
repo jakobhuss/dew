@@ -229,46 +229,49 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 		return
 	}
 
-	msg := dnsJob.getAMsg()
+	if len(dnsJob.Lookups) == 1 {
+		msg := dnsJob.getAMsg()
 
-	switch msg.MsgHdr.Rcode {
-	case dns.RcodeSuccess:
+		if msg.MsgHdr.Rcode == dns.RcodeNameError {
+			removeJob(d, jobs, "NXDOMAIN")
+			return
+		}
+
 		if dnsJob.NLookups < minVerifications {
 			debugLog("Increases number of needed lookups:", len(dnsJob.Lookups))
 			dnsJob.setNLookups(minVerifications)
-		} else if len(dnsJob.Lookups) < minVerifications {
-			debugLog("Need more results for verification", len(dnsJob.Lookups))
-		} else if exists(dnsJob) {
-			//wildcard check for domain d
-			wd := BuildWildcardCheckDomain(fullDomain)
-			wildcardDnsJob, ok := getLookup(wd)
-			if !ok {
-				debugLog("No wildcard check domain found, sending out dns for:", wd)
-				createLookup(wd, minVerifications)
-				return
-			} else if len(wildcardDnsJob.Lookups) != minVerifications {
-				debugLog("Need more wildcard results for verification", len(dnsJob.Lookups))
-				return
-			} else if isWildcard(dnsJob, wildcardDnsJob) {
-				debugLog("Domain is a wildcard:", d)
-				removeJob(d, jobs, "wildcard")
-			} else {
-				//Not a wildcard, lets print
-				out(d, &dnsJob.Lookups)
-				removeJob(d, jobs, "success")
-			}
-		} else {
-			removeJob(d, jobs, "verification_failed")
+			return
 		}
-		return
-	case dns.RcodeNameError:
-		removeJob(d, jobs, "NXDOMAIN")
-	default:
-		//TODO check if we want to abort all other Rcodes
-		//There should be a retry mechanism
-		removeJob(d, jobs, "unknown_Rcode")
-		debugLog("Unhandled Rcode", msg.MsgHdr.Rcode, d, len(*jobs))
 	}
+
+	if len(dnsJob.Lookups) < minVerifications {
+		debugLog("Need more results for verification", len(dnsJob.Lookups))
+		return
+	}
+
+	if !exists(dnsJob) {
+		removeJob(d, jobs, "verification_failed")
+		return
+	}
+
+	wd := BuildWildcardCheckDomain(fullDomain)
+	wildcardDnsJob, ok := getLookup(wd)
+	if !ok {
+		debugLog("No wildcard check domain found, sending out dns for:", wd)
+		createLookup(wd, minVerifications)
+		return
+	} else if len(wildcardDnsJob.Lookups) != minVerifications {
+		debugLog("Need more wildcard results for verification", len(dnsJob.Lookups))
+		return
+	} else if isWildcard(dnsJob, wildcardDnsJob) {
+		debugLog("Domain is a wildcard:", d)
+		removeJob(d, jobs, "wildcard")
+		return
+	}
+
+	//Not a wildcard, lets print
+	out(d, &dnsJob.Lookups)
+	removeJob(d, jobs, "success")
 }
 
 func getLookup(d string) (*DnsJob, bool) {
