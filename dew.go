@@ -7,6 +7,7 @@ import "os"
 import "log"
 import "net"
 import "sync"
+import "sort"
 import "time"
 import "strings"
 import "math/rand"
@@ -220,7 +221,7 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 	fullDomain := dns.Fqdn(d)
 	dnsJob, ok := getLookup(fullDomain)
 	if !ok {
-		createLookup(fullDomain)
+		createLookup(fullDomain, 1)
 		return
 	}
 
@@ -233,34 +234,31 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 	switch msg.MsgHdr.Rcode {
 	case dns.RcodeSuccess:
 		if dnsJob.NLookups < minVerifications {
+			debugLog("Increases number of needed lookups:", len(dnsJob.Lookups))
 			dnsJob.setNLookups(minVerifications)
+		} else if len(dnsJob.Lookups) < minVerifications {
 			debugLog("Need more results for verification", len(dnsJob.Lookups))
-		} else if verify(dnsJob) {
-			if isCachedWildcard(msg, &wildcards) {
-				debugLog("Cache hit for wildcard domain")
+		} else if exists(dnsJob) {
+			//wildcard check for domain d
+			wd := BuildWildcardCheckDomain(fullDomain)
+			wildcardDnsJob, ok := getLookup(wd)
+			if !ok {
+				debugLog("No wildcard check domain found, sending out dns for:", wd)
+				createLookup(wd, minVerifications)
+				return
+			} else if len(wildcardDnsJob.Lookups) != minVerifications {
+				debugLog("Need more wildcard results for verification", len(dnsJob.Lookups))
+				return
+			} else if isWildcard(dnsJob, wildcardDnsJob) {
+				debugLog("Domain is a wildcard:", d)
+				removeJob(d, jobs, "wildcard")
 			} else {
-				//wildcard check for domain d
-				wd := BuildWildcardCheckDomain(fullDomain)
-				wildcardDnsJob, ok := getLookup(wd)
-				if !ok {
-					debugLog("No wildcard check domain found, sending out dns for:", wd)
-					createLookup(wd)
-					return
-				} else if len(wildcardDnsJob.Lookups) == 0 {
-					return
-				} else if isWildcard(dnsJob, wildcardDnsJob) {
-					debugLog("Domain is a wildcard:", d)
-					//TODO add to wildcard cache
-					//TODO remove wd from lookups
-					removeJob(d, jobs, "wildcard")
-				} else {
-					//Not a wildcard, lets print
-					out(d, msg)
-					removeJob(d, jobs, "success")
-				}
+				//Not a wildcard, lets print
+				out(d, &dnsJob.Lookups)
+				removeJob(d, jobs, "success")
 			}
 		} else {
-			removeJob(d, jobs, "verfication_failed")
+			removeJob(d, jobs, "verification_failed")
 		}
 		return
 	case dns.RcodeNameError:
@@ -280,10 +278,10 @@ func getLookup(d string) (*DnsJob, bool) {
 	return dnsJob, ok
 }
 
-func createLookup(d string) {
+func createLookup(d string, n int) {
 	debugLog("Creating new dns job:", d)
 	lookupsMutex.Lock()
-	lookups[d] = &DnsJob{Name: d, Lookups: map[string]*dns.Msg{}, NLookups: 1}
+	lookups[d] = &DnsJob{Name: d, Lookups: map[string]*dns.Msg{}, NLookups: n}
 	lookupsMutex.Unlock()
 }
 
@@ -303,8 +301,7 @@ func clearLookups(d string) {
 	lookupsMutex.Unlock()
 }
 
-func verify(j *DnsJob) bool {
-	//TODO improve verification algorithm
+func exists(j *DnsJob) bool {
 	//TODO penalize bad resolvers
 	msgs := j.Lookups
 	j.Lock()
@@ -313,7 +310,7 @@ func verify(j *DnsJob) bool {
 	var m *dns.Msg
 	for _, msg := range msgs {
 		m = msg
-		if len(msg.Answer) > 0 {
+		if msg.MsgHdr.Rcode == dns.RcodeSuccess {
 			votes++
 		} else {
 			votes--
@@ -321,10 +318,10 @@ func verify(j *DnsJob) bool {
 	}
 	d := m.Question[0].Name
 	if votes < 1 {
-		debugLog("Verification failed for domain:", d)
+		debugLog("Domain does not exist:", d)
 		return false
 	}
-	debugLog("Verification succeded for domain:", d)
+	debugLog("Domain exists:", d)
 
 	return true
 }
@@ -345,59 +342,50 @@ func (dnsJob *DnsJob) getAMsg() *dns.Msg {
 	return nil
 }
 
-func isCachedWildcard(msg *dns.Msg, cache *map[string]map[string]bool) bool {
-	levels := GenLevels(msg.Question[0].Name)
-	msg_addrs := GetIpv4Addrs(*msg)
-
-	for i := 0; i < len(levels)-1; i++ {
-		if val, ok := (*cache)[levels[i]]; ok {
-			if KeyIntersect(msg_addrs, val) {
-				debugLog(msg_addrs, val)
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func isWildcard(j, wj *DnsJob) bool {
-	if len(wj.Lookups) == 0 {
+	if exists(j) && !exists(wj) {
 		return false
 	}
 
-	msg := j.getAMsg()
-	wmsg := wj.getAMsg()
+	j.Lock()
+	defer j.Unlock()
+	wj.Lock()
+	defer wj.Unlock()
 
-	if len((*wmsg).Answer) == 0 {
-		return false
+	addrsCount := CountIpv4Addrs(&j.Lookups)
+	wAddrsCount := CountIpv4Addrs(&wj.Lookups)
+
+	if len(addrsCount) == 0 && len(wAddrsCount) == 0 {
+		return true
 	}
 
-	maddr := GetIpv4Addrs(*msg)
-	waddr := GetIpv4Addrs(*wmsg)
-
-	return KeyIntersect(maddr, waddr)
-}
-
-func KeyIntersect(a map[string]bool, b map[string]bool) bool {
-	for k, _ := range a {
-		if _, ok := b[k]; ok {
+	for ip, count := range addrsCount {
+		if count < 2 {
+			continue
+		}
+		if wCount, ok := wAddrsCount[ip]; ok && wCount > 1 {
 			return true
 		}
 	}
+
 	return false
 }
 
-func GenLevels(d string) []string {
-	split := strings.Split(strings.Trim(d, " ."), ".")
-	var levels []string
+func CountIpv4Addrs(msgs *map[string]*dns.Msg) map[string]int {
+	addrs := map[string]int{}
 
-	for i := 0; i < len(split); i++ {
-		levels = append(levels, strings.Join(split[i:], "."))
+	for _, msg := range *msgs {
+		for ip := range GetIpv4Addrs(msg) {
+			if _, ok := addrs[ip]; !ok {
+				addrs[ip] = 0
+			}
+			addrs[ip]++
+		}
 	}
-	return levels
+	return addrs
 }
 
-func GetIpv4Addrs(msg dns.Msg) map[string]bool {
+func GetIpv4Addrs(msg *dns.Msg) map[string]bool {
 	addrs := map[string]bool{}
 	for _, answer := range msg.Answer {
 		if a, ok := answer.(*dns.A); ok {
@@ -412,22 +400,19 @@ func BuildWildcardCheckDomain(d string) string {
 	return strings.ToLower(GetMD5Hash(base+"Salt: 42")) + "." + base
 }
 
-func printWildcards() {
-	for wildcard, ips := range wildcards {
-		s := "*." + wildcard
-		if verbose {
-			for ip, _ := range ips {
-				s += " " + ip
-			}
-		}
-		fmt.Println(s)
-	}
-}
-
-func out(d string, msg *dns.Msg) {
+func out(d string, msgs *map[string]*dns.Msg) {
 	s := d
 	if verbose {
-		for ip, _ := range GetIpv4Addrs(*msg) {
+		ips := []string{}
+
+		for ip, count := range CountIpv4Addrs(msgs) {
+			if count > 1 {
+				ips = append(ips, ip)
+			}
+		}
+		sort.Strings(ips)
+
+		for _, ip := range ips {
 			s += " " + ip
 		}
 	}
