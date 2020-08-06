@@ -41,7 +41,7 @@ var lookups = map[string]*DnsJob{}
 var lookupsMutex = &sync.RWMutex{}
 
 type DnsJob struct {
-	sync.Mutex
+	sync.RWMutex
 	Name        string
 	NLookups    int
 	RequestTime time.Time
@@ -101,11 +101,11 @@ func loadJobs(jobs *map[string]bool, wg *sync.WaitGroup) {
 func retryer(wg *sync.WaitGroup) {
 	defer wg.Done()
 	for hasWork() {
-		debugLog("Starting retryer loop")
+		debugLog("Starting retryer loop, number of jobs:", len(jobs))
 		shortSleep()
 		lookupsMutex.RLock()
 		for d, dnsJob := range lookups {
-			if len(dnsJob.Lookups) == dnsJob.NLookups || dnsJob.RequestTime.Add(dnsTimeout).After(time.Now()) {
+			if len(dnsJob.Lookups) >= dnsJob.NLookups || dnsJob.RequestTime.Add(dnsTimeout).After(time.Now()) {
 				continue
 			}
 			debugLog("Sending new requests:", d)
@@ -132,9 +132,24 @@ func sender(ch chan string, c *net.UDPConn, wg *sync.WaitGroup) {
 	debugLog("Dns channel is closed")
 }
 
+func randomResolver(j *DnsJob) net.IP {
+	rand := rand.Int()
+	for i := 0; i < len(resolvers); i++ {
+		resolver := resolvers[(i+rand)%len(resolvers)]
+		j.RLock()
+		_, ok := j.Lookups[resolver.String()]
+		j.RUnlock()
+		if !ok {
+			return resolver
+		}
+	}
+	debugLog("Could not find unused resolver:", j.Name)
+	return resolvers[0]
+}
+
 func sendDns(d string, j *DnsJob, c *net.UDPConn) error {
 	debugLog("Sending dns:", d)
-	resolver := resolvers[rand.Intn(len(resolvers))]
+	resolver := randomResolver(j)
 	addr := &net.UDPAddr{IP: resolver, Port: 53}
 
 	m := new(dns.Msg)
@@ -181,6 +196,16 @@ func reciever(c *net.UDPConn, wg *sync.WaitGroup) {
 			continue
 		}
 		debugLog("Recieved response for:", name)
+
+		j.RLock()
+		_, ok = j.Lookups[addr.String()]
+		j.RUnlock()
+
+		if ok {
+			debugLog("Response from same resolver:", addr.String())
+			continue
+		}
+
 		j.Lock()
 		j.Lookups[addr.String()] = m
 		j.Unlock()
@@ -204,7 +229,7 @@ func debugLog(v ...interface{}) {
 func worker(jobs *map[string]bool, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for hasWork() {
-		debugLog("Worker loop")
+		debugLog("Worker loop, number of jobs:", len(*jobs))
 		jobsMutex.RLock()
 		for d, _ := range *jobs {
 			debugLog("Checking job status:", d)
@@ -229,7 +254,7 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 		return
 	}
 
-	if len(dnsJob.Lookups) == 1 {
+	if len(dnsJob.Lookups) >= 1 && dnsJob.NLookups == 1 {
 		msg := dnsJob.getAMsg()
 
 		if msg.MsgHdr.Rcode == dns.RcodeNameError {
@@ -269,7 +294,6 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 		return
 	}
 
-	//Not a wildcard, lets print
 	out(d, &dnsJob.Lookups)
 	removeJob(d, jobs, "success")
 }
@@ -305,26 +329,21 @@ func clearLookups(d string) {
 }
 
 func exists(j *DnsJob) bool {
-	//TODO penalize bad resolvers
-	msgs := j.Lookups
-	j.Lock()
-	defer j.Unlock()
+	j.RLock()
 	votes := 0
-	var m *dns.Msg
-	for _, msg := range msgs {
-		m = msg
+	for _, msg := range j.Lookups {
 		if msg.MsgHdr.Rcode == dns.RcodeSuccess {
 			votes++
 		} else {
 			votes--
 		}
 	}
-	d := m.Question[0].Name
+	j.RUnlock()
 	if votes < 1 {
-		debugLog("Domain does not exist:", d)
+		debugLog("Domain does not exist:", j.Name)
 		return false
 	}
-	debugLog("Domain exists:", d)
+	debugLog("Domain exists:", j.Name)
 
 	return true
 }
@@ -337,8 +356,8 @@ func (dnsJob *DnsJob) setNLookups(n int) {
 }
 
 func (dnsJob *DnsJob) getAMsg() *dns.Msg {
-	dnsJob.Lock()
-	defer dnsJob.Unlock()
+	dnsJob.RLock()
+	defer dnsJob.RUnlock()
 	for _, msg := range dnsJob.Lookups {
 		return msg
 	}
@@ -350,13 +369,12 @@ func isWildcard(j, wj *DnsJob) bool {
 		return false
 	}
 
-	j.Lock()
-	defer j.Unlock()
-	wj.Lock()
-	defer wj.Unlock()
-
+	j.RLock()
 	addrsCount := CountIpv4Addrs(&j.Lookups)
+	j.RUnlock()
+	wj.RLock()
 	wAddrsCount := CountIpv4Addrs(&wj.Lookups)
+	wj.RUnlock()
 
 	if len(addrsCount) == 0 && len(wAddrsCount) == 0 {
 		return true
@@ -429,7 +447,7 @@ func parseFlags() {
 	flag.BoolVar(&debug, "debug", false, "Outputs debug information")
 	flag.DurationVar(&dnsTimeout, "dt", 1000*time.Millisecond, "DNS Timeout in millisecods")
 	flag.IntVar(&nConcurrentJobs, "cj", 1000, "Number of concurrent jobs")
-	flag.IntVar(&minVerifications, "mv", 3, "Number of required verification dns requests")
+	flag.IntVar(&minVerifications, "mv", 3, "Minimum number of required verification dns requests")
 
 	help := flag.Bool("-help", false, "Prints help text")
 	flag.BoolVar(help, "h", *help, "alias for --help")
