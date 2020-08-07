@@ -286,7 +286,7 @@ func checkJobProgress(d string, jobs *map[string]bool, dnsch chan string) {
 		createLookup(wd, minVerifications)
 		return
 	} else if len(wildcardDnsJob.Lookups) < minVerifications {
-		debugLog("Need more wildcard results for verification", len(dnsJob.Lookups))
+		debugLog("Need more wildcard results for verification:", len(wildcardDnsJob.Lookups))
 		return
 	} else if isWildcard(dnsJob, wildcardDnsJob) {
 		debugLog("Domain is a wildcard:", d)
