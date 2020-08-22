@@ -369,27 +369,61 @@ func isWildcard(j, wj *DnsJob) bool {
 		return false
 	}
 
-	j.RLock()
-	addrsCount := CountIpv4Addrs(&j.Lookups)
-	j.RUnlock()
-	wj.RLock()
-	wAddrsCount := CountIpv4Addrs(&wj.Lookups)
-	wj.RUnlock()
+	matches := GetQuestionMatches(j)
+	wMatches := GetQuestionMatches(wj)
 
-	if len(addrsCount) == 0 && len(wAddrsCount) == 0 {
+	if len(matches) == 0 && len(wMatches) == 0 {
 		return true
 	}
 
-	for ip, count := range addrsCount {
+	debugLog("Checking wildcard match for:", matches, wMatches)
+	for match, count := range matches {
 		if count < 2 {
 			continue
 		}
-		if wCount, ok := wAddrsCount[ip]; ok && wCount > 1 {
+		if wCount, ok := wMatches[match]; ok && wCount > 1 {
 			return true
 		}
 	}
 
 	return false
+}
+
+func GetQuestionMatches(job *DnsJob) map[string]int {
+	job.RLock()
+	results := map[string]int{}
+
+	for _, msg := range job.Lookups {
+		q := msg.Question[0].Name
+		for _, answer := range msg.Answer {
+			if q != answer.Header().Name {
+				continue
+			}
+			var match string
+			if a, ok := answer.(*dns.A); ok {
+				match = a.A.String()
+			}
+			if cname, ok := answer.(*dns.CNAME); ok {
+				match = cname.Target
+			}
+			if _, ok := results[match]; !ok {
+				results[match] = 0
+			}
+			results[match]++
+		}
+	}
+	job.RUnlock()
+	return results
+}
+
+func GetIpv4Addrs(msg *dns.Msg) map[string]bool {
+	addrs := map[string]bool{}
+	for _, answer := range msg.Answer {
+		if a, ok := answer.(*dns.A); ok {
+			addrs[a.A.String()] = true
+		}
+	}
+	return addrs
 }
 
 func CountIpv4Addrs(msgs *map[string]*dns.Msg) map[string]int {
@@ -401,16 +435,6 @@ func CountIpv4Addrs(msgs *map[string]*dns.Msg) map[string]int {
 				addrs[ip] = 0
 			}
 			addrs[ip]++
-		}
-	}
-	return addrs
-}
-
-func GetIpv4Addrs(msg *dns.Msg) map[string]bool {
-	addrs := map[string]bool{}
-	for _, answer := range msg.Answer {
-		if a, ok := answer.(*dns.A); ok {
-			addrs[a.A.String()] = true
 		}
 	}
 	return addrs
@@ -447,7 +471,7 @@ func parseFlags() {
 	flag.BoolVar(&debug, "debug", false, "Outputs debug information")
 	flag.DurationVar(&dnsTimeout, "dt", 1000*time.Millisecond, "DNS Timeout in millisecods")
 	flag.IntVar(&nConcurrentJobs, "cj", 1000, "Number of concurrent jobs")
-	flag.IntVar(&minVerifications, "mv", 3, "Minimum number of required verification dns requests")
+	flag.IntVar(&minVerifications, "mv", 5, "Minimum number of required verification dns requests")
 
 	help := flag.Bool("-help", false, "Prints help text")
 	flag.BoolVar(help, "h", *help, "alias for --help")
